@@ -271,6 +271,9 @@ function usePersistentState() {
   const [saveStatus, setSaveStatus] = useState('idle'); // 'idle' | 'saving' | 'saved' | 'error'
   const stateRef = useRef(state);
   const skipNextWrite = useRef(true); // don't write back the value we just loaded
+  const debounceRef = useRef(null);   // pending "wait for a pause in typing" timer
+  const inFlightRef = useRef(false);  // is a write currently in progress?
+  const pendingRef = useRef(false);   // did state change again while a write was in flight?
 
   useEffect(() => { stateRef.current = state; }, [state]);
 
@@ -294,18 +297,31 @@ function usePersistentState() {
     return () => { cancelled = true; };
   }, []);
 
-  // Always writes the LATEST value (via ref), and retries a couple of times
-  // before giving up, so a slow or flaky connection doesn't silently drop a save.
-  const writeToStorage = useCallback((value, attempt = 0) => {
+  // Always writes the LATEST value (via ref). If a write is already in
+  // flight when another change comes in, we don't fire a second overlapping
+  // request — we just flag it as pending and re-run once the first finishes.
+  // This is what stops rapid typing/clicking from flooding storage with
+  // near-simultaneous writes and tripping the rate limit.
+  const writeToStorage = useCallback((attempt = 0) => {
+    if (inFlightRef.current) { pendingRef.current = true; return; }
+    inFlightRef.current = true;
     setSaveStatus('saving');
+    const valueToSave = stateRef.current;
+
     (async () => {
       try {
-        if (!window.storage) { setSaveStatus('error'); return; }
-        await window.storage.set(STORAGE_KEY, JSON.stringify(value), false);
-        if (stateRef.current === value) setSaveStatus('saved');
+        if (!window.storage) throw new Error('storage unavailable');
+        await window.storage.set(STORAGE_KEY, JSON.stringify(valueToSave), false);
+        inFlightRef.current = false;
+        setSaveStatus('saved');
+        if (pendingRef.current) {
+          pendingRef.current = false;
+          writeToStorage(0);
+        }
       } catch (e) {
-        if (attempt < 2) {
-          setTimeout(() => writeToStorage(stateRef.current, attempt + 1), 500 * (attempt + 1));
+        inFlightRef.current = false;
+        if (attempt < 3) {
+          setTimeout(() => writeToStorage(attempt + 1), 600 * (attempt + 1));
         } else {
           setSaveStatus('error');
         }
@@ -314,10 +330,14 @@ function usePersistentState() {
   }, []);
 
   // Persist any time state actually changes, after the initial load has settled.
+  // Debounced: typing a number or dragging quickly won't fire a write per
+  // keystroke — it waits for a short pause, then saves the latest value once.
   useEffect(() => {
     if (!ready) return;
     if (skipNextWrite.current) { skipNextWrite.current = false; return; }
-    writeToStorage(state);
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(() => writeToStorage(0), 600);
+    return () => clearTimeout(debounceRef.current);
   }, [state, ready, writeToStorage]);
 
   // Accepts either a value or an updater function `(prevState) => nextState`,
@@ -411,7 +431,7 @@ function SaveIndicator({ status }) {
     idle: { label: 'Not saved yet', color: 'text-slate-500', dot: 'bg-slate-600' },
     saving: { label: 'Saving…', color: 'text-amber-400', dot: 'bg-amber-400 animate-pulse' },
     saved: { label: 'Saved', color: 'text-teal-400', dot: 'bg-teal-400' },
-    error: { label: 'Not saved — retrying…', color: 'text-rose-400', dot: 'bg-rose-400 animate-pulse' },
+    error: { label: 'Couldn’t save — will retry on your next change', color: 'text-rose-400', dot: 'bg-rose-400' },
   };
   const m = map[status] || map.idle;
   return (
