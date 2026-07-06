@@ -279,54 +279,50 @@ function usePersistentState() {
 
   useEffect(() => {
     let cancelled = false;
-    (async () => {
-      try {
-        if (window.storage) {
-          const res = await window.storage.get(STORAGE_KEY, false);
-          if (!cancelled && res && res.value) {
-            const parsed = JSON.parse(res.value);
-            setStateRaw({ ...defaultState(), ...parsed });
-          }
-        }
-      } catch (e) {
-        /* nothing saved yet, or storage unavailable — fall back to defaults */
-      } finally {
-        if (!cancelled) setReady(true);
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!cancelled && raw) {
+        const parsed = JSON.parse(raw);
+        setStateRaw({ ...defaultState(), ...parsed });
       }
-    })();
+    } catch (e) {
+      /* nothing saved yet, or storage unavailable (e.g. private browsing) — fall back to defaults */
+    } finally {
+      if (!cancelled) setReady(true);
+    }
     return () => { cancelled = true; };
   }, []);
 
   // Always writes the LATEST value (via ref). If a write is already in
   // flight when another change comes in, we don't fire a second overlapping
-  // request — we just flag it as pending and re-run once the first finishes.
-  // This is what stops rapid typing/clicking from flooding storage with
-  // near-simultaneous writes and tripping the rate limit.
+  // write — we just flag it as pending and re-run once the first finishes.
+  // localStorage writes are synchronous, so "in flight" is brief, but this
+  // still protects against a burst of state changes queuing up redundant writes.
   const writeToStorage = useCallback((attempt = 0) => {
     if (inFlightRef.current) { pendingRef.current = true; return; }
     inFlightRef.current = true;
     setSaveStatus('saving');
     const valueToSave = stateRef.current;
 
-    (async () => {
-      try {
-        if (!window.storage) throw new Error('storage unavailable');
-        await window.storage.set(STORAGE_KEY, JSON.stringify(valueToSave), false);
-        inFlightRef.current = false;
-        setSaveStatus('saved');
-        if (pendingRef.current) {
-          pendingRef.current = false;
-          writeToStorage(0);
-        }
-      } catch (e) {
-        inFlightRef.current = false;
-        if (attempt < 3) {
-          setTimeout(() => writeToStorage(attempt + 1), 600 * (attempt + 1));
-        } else {
-          setSaveStatus('error');
-        }
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(valueToSave));
+      inFlightRef.current = false;
+      setSaveStatus('saved');
+      if (pendingRef.current) {
+        pendingRef.current = false;
+        writeToStorage(0);
       }
-    })();
+    } catch (e) {
+      // Most common real-world cause: private/incognito browsing with storage
+      // disabled, or storage quota exceeded. Retrying rarely helps here, but
+      // we still back off a couple of times in case it's a transient issue.
+      inFlightRef.current = false;
+      if (attempt < 2) {
+        setTimeout(() => writeToStorage(attempt + 1), 400 * (attempt + 1));
+      } else {
+        setSaveStatus('error');
+      }
+    }
   }, []);
 
   // Persist any time state actually changes, after the initial load has settled.
@@ -430,8 +426,8 @@ function SaveIndicator({ status }) {
   const map = {
     idle: { label: 'Not saved yet', color: 'text-slate-500', dot: 'bg-slate-600' },
     saving: { label: 'Saving…', color: 'text-amber-400', dot: 'bg-amber-400 animate-pulse' },
-    saved: { label: 'Saved', color: 'text-teal-400', dot: 'bg-teal-400' },
-    error: { label: 'Couldn’t save — will retry on your next change', color: 'text-rose-400', dot: 'bg-rose-400' },
+    saved: { label: 'Saved to this browser', color: 'text-teal-400', dot: 'bg-teal-400' },
+    error: { label: 'Couldn’t save — private browsing may be blocking storage', color: 'text-rose-400', dot: 'bg-rose-400' },
   };
   const m = map[status] || map.idle;
   return (
@@ -969,8 +965,8 @@ export default function App() {
         <footer className="mt-10 pt-5 border-t border-slate-800 text-center animate-cardin">
           <p className="text-xs text-slate-600">
             {saveStatus === 'error'
-              ? 'Having trouble saving right now — your changes are kept while this tab stays open, and will keep retrying in the background.'
-              : 'Progress and checklists save automatically on this device.'}
+              ? 'Having trouble saving — if you\'re in a private/incognito window, switch to a regular one so progress can be saved.'
+              : 'Progress and checklists save automatically in this browser.'}
           </p>
         </footer>
       </div>
