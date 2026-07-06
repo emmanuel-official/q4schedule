@@ -266,8 +266,14 @@ function defaultState() {
   };
 }
 function usePersistentState() {
-  const [state, setState] = useState(defaultState());
+  const [state, setStateRaw] = useState(defaultState());
   const [ready, setReady] = useState(false);
+  const [saveStatus, setSaveStatus] = useState('idle'); // 'idle' | 'saving' | 'saved' | 'error'
+  const stateRef = useRef(state);
+  const skipNextWrite = useRef(true); // don't write back the value we just loaded
+
+  useEffect(() => { stateRef.current = state; }, [state]);
+
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -276,52 +282,94 @@ function usePersistentState() {
           const res = await window.storage.get(STORAGE_KEY, false);
           if (!cancelled && res && res.value) {
             const parsed = JSON.parse(res.value);
-            setState(prev => ({ ...defaultState(), ...parsed }));
+            setStateRaw({ ...defaultState(), ...parsed });
           }
         }
       } catch (e) {
-        /* no saved state yet */
+        /* nothing saved yet, or storage unavailable — fall back to defaults */
       } finally {
         if (!cancelled) setReady(true);
       }
     })();
     return () => { cancelled = true; };
   }, []);
-  const persist = useCallback((next) => {
-    setState(next);
+
+  // Always writes the LATEST value (via ref), and retries a couple of times
+  // before giving up, so a slow or flaky connection doesn't silently drop a save.
+  const writeToStorage = useCallback((value, attempt = 0) => {
+    setSaveStatus('saving');
     (async () => {
       try {
-        if (window.storage) await window.storage.set(STORAGE_KEY, JSON.stringify(next), false);
-      } catch (e) { /* ignore write failure */ }
+        if (!window.storage) { setSaveStatus('error'); return; }
+        await window.storage.set(STORAGE_KEY, JSON.stringify(value), false);
+        if (stateRef.current === value) setSaveStatus('saved');
+      } catch (e) {
+        if (attempt < 2) {
+          setTimeout(() => writeToStorage(stateRef.current, attempt + 1), 500 * (attempt + 1));
+        } else {
+          setSaveStatus('error');
+        }
+      }
     })();
   }, []);
-  return [state, persist, ready];
+
+  // Persist any time state actually changes, after the initial load has settled.
+  useEffect(() => {
+    if (!ready) return;
+    if (skipNextWrite.current) { skipNextWrite.current = false; return; }
+    writeToStorage(state);
+  }, [state, ready, writeToStorage]);
+
+  // Accepts either a value or an updater function `(prevState) => nextState`,
+  // exactly like React's setState, so every caller always builds off the
+  // freshest state instead of a possibly-stale prop/closure.
+  const setState = useCallback((updater) => {
+    setStateRaw(prev => (typeof updater === 'function' ? updater(prev) : updater));
+  }, []);
+
+  return [state, setState, ready, saveStatus];
 }
 
 /* ============================== SMALL UI PIECES ============================== */
 
 function CountdownRing({ percent, dayNumber, totalDays }) {
   const [animated, setAnimated] = useState(false);
+  const [displayDay, setDisplayDay] = useState(0);
   useEffect(() => { const t = setTimeout(() => setAnimated(true), 80); return () => clearTimeout(t); }, []);
+  useEffect(() => {
+    let raf;
+    const duration = 900;
+    const start = performance.now();
+    const tick = (now) => {
+      const t = Math.min(1, (now - start) / duration);
+      const eased = 1 - Math.pow(1 - t, 3);
+      setDisplayDay(Math.round(eased * dayNumber));
+      if (t < 1) raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [dayNumber]);
   const r = 54;
   const c = 2 * Math.PI * r;
   const offset = animated ? c - (Math.min(percent, 100) / 100) * c : c;
   const ticks = Array.from({ length: 24 });
   return (
     <div className="relative w-36 h-36 shrink-0">
-      <svg viewBox="0 0 120 120" className="w-36 h-36 -rotate-90">
+      <div className="absolute inset-0 rounded-full animate-glow" />
+      <svg viewBox="0 0 120 120" className="w-36 h-36 -rotate-90 relative">
         {ticks.map((_, i) => {
           const angle = (i / 24) * 360;
           return (
             <line key={i} x1="60" y1="6" x2="60" y2={i % 6 === 0 ? '13' : '10'}
               stroke="#334155" strokeWidth={i % 6 === 0 ? 1.5 : 1}
-              transform={`rotate(${angle} 60 60)`} />
+              transform={`rotate(${angle} 60 60)`}
+              style={{ transition: 'stroke .3s ease', animation: animated ? undefined : undefined }} />
           );
         })}
         <circle cx="60" cy="60" r={r} fill="none" stroke="#1e293b" strokeWidth="7" />
         <circle cx="60" cy="60" r={r} fill="none" stroke="url(#ringGrad)" strokeWidth="7"
           strokeLinecap="round" strokeDasharray={c} strokeDashoffset={offset}
-          style={{ transition: 'stroke-dashoffset 1.1s ease-out' }} />
+          style={{ transition: 'stroke-dashoffset 1.1s cubic-bezier(.16,1,.3,1)' }} />
         <defs>
           <linearGradient id="ringGrad" x1="0%" y1="0%" x2="100%" y2="100%">
             <stop offset="0%" stopColor="#2dd4bf" />
@@ -331,7 +379,7 @@ function CountdownRing({ percent, dayNumber, totalDays }) {
       </svg>
       <div className="absolute inset-0 flex flex-col items-center justify-center rotate-0">
         <span className="text-[10px] tracking-widest text-slate-400 uppercase" style={{ fontFamily: "'IBM Plex Mono', monospace" }}>Day</span>
-        <span className="text-3xl text-slate-50 leading-none" style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{String(dayNumber).padStart(3, '0')}</span>
+        <span className="text-3xl text-slate-50 leading-none tabular-nums" style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{String(displayDay).padStart(3, '0')}</span>
         <span className="text-[10px] text-slate-500" style={{ fontFamily: "'IBM Plex Mono', monospace" }}>/ {totalDays}</span>
       </div>
     </div>
@@ -340,57 +388,98 @@ function CountdownRing({ percent, dayNumber, totalDays }) {
 
 function MarqueeTitle({ text }) {
   return (
-    <h1 className="text-4xl sm:text-5xl tracking-wide" style={{ fontFamily: "'Bebas Neue', sans-serif", letterSpacing: '0.04em' }}>
-      {text.split('').map((ch, i) => (
-        <span key={i} className="inline-block" style={{
-          animation: 'flicker 1.4s ease-out both',
-          animationDelay: `${i * 0.035}s`,
-          color: i % 7 === 3 ? '#f59e0b' : '#f8fafc',
-        }}>{ch === ' ' ? ' ' : ch}</span>
-      ))}
-    </h1>
+    <div className="relative inline-block overflow-hidden">
+      <h1 className="text-4xl sm:text-5xl tracking-wide relative" style={{ fontFamily: "'Bebas Neue', sans-serif", letterSpacing: '0.04em' }}>
+        {text.split('').map((ch, i) => (
+          <span key={i} className="inline-block" style={{
+            animation: 'flicker 1.4s ease-out both',
+            animationDelay: `${i * 0.035}s`,
+            color: i % 7 === 3 ? '#f59e0b' : '#f8fafc',
+          }}>{ch === ' ' ? ' ' : ch}</span>
+        ))}
+      </h1>
+      <div className="pointer-events-none absolute inset-y-0 w-1/3" style={{
+        background: 'linear-gradient(100deg, transparent, rgba(255,255,255,.5), transparent)',
+        animation: 'shimmerSweep 4.5s ease-in-out 2.2s infinite',
+      }} />
+    </div>
+  );
+}
+
+function SaveIndicator({ status }) {
+  const map = {
+    idle: { label: 'Not saved yet', color: 'text-slate-500', dot: 'bg-slate-600' },
+    saving: { label: 'Saving…', color: 'text-amber-400', dot: 'bg-amber-400 animate-pulse' },
+    saved: { label: 'Saved', color: 'text-teal-400', dot: 'bg-teal-400' },
+    error: { label: 'Not saved — retrying…', color: 'text-rose-400', dot: 'bg-rose-400 animate-pulse' },
+  };
+  const m = map[status] || map.idle;
+  return (
+    <span className={`inline-flex items-center gap-1.5 transition-colors duration-300 ${m.color}`}>
+      <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${m.dot}`} />
+      {m.label}
+    </span>
   );
 }
 
 function ChannelToggle({ channel, setChannel }) {
+  const isShorts = channel === 'shorts';
   return (
-    <div className="inline-flex rounded-full border border-slate-700 bg-slate-900/60 p-1">
+    <div className="relative inline-flex w-64 rounded-full border border-slate-700 bg-slate-900/60 p-1 overflow-hidden">
+      <div
+        className="absolute top-1 bottom-1 left-1 w-[calc(50%-4px)] rounded-full"
+        style={{
+          background: isShorts ? 'linear-gradient(135deg,#fbbf24,#f59e0b)' : 'linear-gradient(135deg,#2dd4bf,#0d9488)',
+          transform: isShorts ? 'translateX(calc(100% + 4px))' : 'translateX(0)',
+          transition: 'transform .35s cubic-bezier(.16,1,.3,1), background .35s ease',
+          boxShadow: isShorts ? '0 4px 16px -4px rgba(245,158,11,.5)' : '0 4px 16px -4px rgba(45,212,191,.5)',
+        }}
+      />
       <button onClick={() => setChannel('longform')}
-        className={`flex items-center gap-1.5 px-4 py-1.5 rounded-full text-sm transition-all duration-200 ${channel === 'longform' ? 'bg-teal-500 text-slate-950 font-semibold shadow' : 'text-slate-400 hover:text-slate-200'}`}>
-        <Film size={15} /> Long-Form
+        className={`relative z-10 flex-1 flex items-center justify-center gap-1.5 px-4 py-1.5 rounded-full text-sm transition-colors duration-300 ${!isShorts ? 'text-slate-950 font-semibold' : 'text-slate-400 hover:text-slate-200'}`}>
+        <Film size={15} className={!isShorts ? 'animate-float' : ''} /> Long-Form
       </button>
       <button onClick={() => setChannel('shorts')}
-        className={`flex items-center gap-1.5 px-4 py-1.5 rounded-full text-sm transition-all duration-200 ${channel === 'shorts' ? 'bg-amber-400 text-slate-950 font-semibold shadow' : 'text-slate-400 hover:text-slate-200'}`}>
-        <Scissors size={15} /> Shorts
+        className={`relative z-10 flex-1 flex items-center justify-center gap-1.5 px-4 py-1.5 rounded-full text-sm transition-colors duration-300 ${isShorts ? 'text-slate-950 font-semibold' : 'text-slate-400 hover:text-slate-200'}`}>
+        <Scissors size={15} className={isShorts ? 'animate-float' : ''} /> Shorts
       </button>
     </div>
   );
 }
 
-function Card({ children, className = '' }) {
+function Card({ children, className = '', delay = 0, noAnim = false }) {
   return (
-    <div className={`rounded-2xl border border-slate-800 bg-slate-900/50 backdrop-blur-sm p-5 transition-all duration-300 hover:border-slate-700 ${className}`}>
+    <div
+      className={`rounded-2xl border border-slate-800 bg-slate-900/50 backdrop-blur-sm p-5 hover-lift ${noAnim ? '' : 'animate-cardin'} ${className}`}
+      style={noAnim ? undefined : { animationDelay: `${delay}ms` }}
+    >
       {children}
     </div>
   );
 }
 
 function ProgressBar({ value, max, accent = '#2dd4bf' }) {
+  const [grown, setGrown] = useState(false);
+  useEffect(() => { const t = setTimeout(() => setGrown(true), 60); return () => clearTimeout(t); }, []);
   const pct = Math.max(0, Math.min(100, (value / max) * 100 || 0));
   return (
     <div className="w-full h-2 rounded-full bg-slate-800 overflow-hidden">
-      <div className="h-full rounded-full" style={{ width: `${pct}%`, background: accent, transition: 'width 0.8s ease-out' }} />
+      <div className="relative h-full rounded-full overflow-hidden" style={{ width: grown ? `${pct}%` : '0%', background: accent, transition: 'width 1s cubic-bezier(.16,1,.3,1)' }}>
+        {pct > 0 && pct < 100 && <div className="absolute inset-0 progress-shimmer" />}
+      </div>
     </div>
   );
 }
 
 function ChecklistItem({ label, checked, onToggle }) {
   return (
-    <button onClick={onToggle} className="flex items-start gap-2.5 w-full text-left group py-1 active:scale-[0.99] transition-transform">
-      {checked
-        ? <CheckCircle2 size={18} className="mt-0.5 shrink-0 text-teal-400" />
-        : <Circle size={18} className="mt-0.5 shrink-0 text-slate-600 group-hover:text-slate-400" />}
-      <span className={`text-sm leading-snug ${checked ? 'text-slate-500 line-through' : 'text-slate-200'}`}>{label}</span>
+    <button onClick={onToggle} className="flex items-start gap-2.5 w-full text-left group py-1.5 px-1 -mx-1 rounded-lg active:scale-[0.98] hover:bg-slate-800/40 transition-all">
+      <span key={checked ? 'on' : 'off'} className="mt-0.5 shrink-0 animate-pop">
+        {checked
+          ? <CheckCircle2 size={18} className="text-teal-400" />
+          : <Circle size={18} className="text-slate-600 group-hover:text-slate-400 transition-colors" />}
+      </span>
+      <span className={`text-sm leading-snug transition-all duration-300 ${checked ? 'text-slate-500 line-through' : 'text-slate-200'}`}>{label}</span>
     </button>
   );
 }
@@ -405,10 +494,11 @@ function DashboardView({ schedule, phase, stats }) {
   const shDone = schedule.filter(d => d.dayNumber <= dayNumber - 1).flatMap(d => d.posts).filter(p => p.channel === 'shorts').length;
 
   return (
-    <div className="space-y-6 animate-fadein">
-      <Card className="flex flex-col sm:flex-row items-center gap-6">
+    <div className="space-y-6">
+      <Card className="flex flex-col sm:flex-row items-center gap-6 overflow-hidden relative" delay={0}>
+        <div className="pointer-events-none absolute -top-10 -right-10 w-40 h-40 rounded-full bg-teal-500/10 blur-3xl" style={{ animation: 'ambientPulse 5s ease-in-out infinite' }} />
         <CountdownRing percent={percent} dayNumber={dayNumber} totalDays={90} />
-        <div className="flex-1 text-center sm:text-left">
+        <div className="flex-1 text-center sm:text-left relative">
           <p className="text-xs uppercase tracking-widest text-amber-400 mb-1" style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{phase.reel} — {phase.weekLabel}</p>
           <h3 className="text-xl font-semibold text-slate-50">{phase.title}</h3>
           <p className="text-sm text-slate-400 mt-1">{phase.blurb}</p>
@@ -416,27 +506,27 @@ function DashboardView({ schedule, phase, stats }) {
       </Card>
 
       <div className="grid sm:grid-cols-2 gap-4">
-        <Card>
-          <div className="flex items-center gap-2 mb-3"><Film size={16} className="text-teal-400" /><h4 className="font-semibold text-slate-100">Long-Form</h4></div>
-          <p className="text-3xl text-slate-50" style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{lfDone}</p>
+        <Card delay={90}>
+          <div className="flex items-center gap-2 mb-3"><Film size={16} className="text-teal-400 animate-float" /><h4 className="font-semibold text-slate-100">Long-Form</h4></div>
+          <p className="text-3xl text-slate-50 tabular-nums" style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{lfDone}</p>
           <p className="text-xs text-slate-500 mb-3">recaps published so far</p>
           <ProgressBar value={stats.lfSubs} max={1000} accent="#2dd4bf" />
           <p className="text-xs text-slate-500 mt-1">{stats.lfSubs}/1,000 subs toward full monetization</p>
         </Card>
-        <Card>
-          <div className="flex items-center gap-2 mb-3"><Scissors size={16} className="text-amber-400" /><h4 className="font-semibold text-slate-100">Shorts</h4></div>
-          <p className="text-3xl text-slate-50" style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{shDone}</p>
+        <Card delay={150}>
+          <div className="flex items-center gap-2 mb-3"><Scissors size={16} className="text-amber-400 animate-float" /><h4 className="font-semibold text-slate-100">Shorts</h4></div>
+          <p className="text-3xl text-slate-50 tabular-nums" style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{shDone}</p>
           <p className="text-xs text-slate-500 mb-3">cutouts published so far</p>
           <ProgressBar value={stats.shViews} max={10000000} accent="#f59e0b" />
           <p className="text-xs text-slate-500 mt-1">{stats.shViews.toLocaleString()}/10,000,000 Shorts views (90-day)</p>
         </Card>
       </div>
 
-      <Card>
+      <Card delay={210}>
         <div className="flex items-center gap-2 mb-2"><Info size={15} className="text-slate-400" /><h4 className="font-semibold text-slate-100 text-sm">Today’s posts</h4></div>
         {today.posts.length === 0 && <p className="text-sm text-slate-500">Rest day — nothing scheduled. Good day to batch-research next week’s titles.</p>}
         {today.posts.map((p, i) => (
-          <div key={i} className="flex items-center gap-3 py-1.5 text-sm">
+          <div key={i} className="flex items-center gap-3 py-1.5 text-sm animate-cardin hover:translate-x-1 transition-transform" style={{ animationDelay: `${260 + i * 60}ms` }}>
             {p.channel === 'longform' ? <Film size={14} className="text-teal-400 shrink-0" /> : <Scissors size={14} className="text-amber-400 shrink-0" />}
             <span className="text-slate-300">{p.movie.title}</span>
             <span className="text-slate-600">—</span>
@@ -451,24 +541,28 @@ function DashboardView({ schedule, phase, stats }) {
 function RoadmapView({ channel, state, setState }) {
   const toggle = (phaseId, idx) => {
     const key = `${phaseId}-${channel}-${idx}`;
-    const next = { ...state, checklist: { ...state.checklist, [key]: !state.checklist[key] } };
-    setState(next);
+    setState(prev => ({ ...prev, checklist: { ...prev.checklist, [key]: !prev.checklist[key] } }));
   };
   return (
-    <div className="space-y-5 animate-fadein">
-      {PHASES.map(phase => {
+    <div className="space-y-5">
+      {PHASES.map((phase, pIdx) => {
         const items = phase.milestones[channel];
         const doneCount = items.filter((_, i) => state.checklist[`${phase.id}-${channel}-${i}`]).length;
+        const complete = doneCount === items.length;
         return (
-          <Card key={phase.id}>
+          <Card key={phase.id} delay={pIdx * 90} className={complete ? 'ring-1 ring-teal-500/30' : ''}>
             <div className="flex items-center justify-between mb-1">
               <div>
                 <p className="text-xs uppercase tracking-widest text-amber-400" style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{phase.reel} · {phase.weekLabel} · Days {phase.dayStart}–{phase.dayEnd}</p>
-                <h3 className="text-lg font-semibold text-slate-50">{phase.title}</h3>
+                <h3 className="text-lg font-semibold text-slate-50 flex items-center gap-2">
+                  {phase.title}
+                  {complete && <span key="badge" className="animate-pop text-teal-400"><Award size={16} /></span>}
+                </h3>
               </div>
-              <span className="text-xs text-slate-500 shrink-0" style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{doneCount}/{items.length}</span>
+              <span key={doneCount} className="text-xs text-slate-400 shrink-0 animate-pop" style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{doneCount}/{items.length}</span>
             </div>
-            <p className="text-sm text-slate-400 mb-3">{phase.blurb}</p>
+            <p className="text-sm text-slate-400 mb-2">{phase.blurb}</p>
+            <div className="mb-3"><ProgressBar value={doneCount} max={items.length} accent={complete ? '#2dd4bf' : '#475569'} /></div>
             <div className="divide-y divide-slate-800/60">
               {items.map((label, i) => (
                 <ChecklistItem key={i} label={label} checked={!!state.checklist[`${phase.id}-${channel}-${i}`]} onToggle={() => toggle(phase.id, i)} />
@@ -498,44 +592,46 @@ function ScheduleView({ schedule, channel }) {
       <Card className="!py-3">
         <p className="text-xs text-slate-400 flex items-center gap-1.5"><Info size={13} /> Titles cycle through the content library below. Once a title repeats, cut a different scene or angle from it — or swap in whatever just released.</p>
       </Card>
-      {Object.entries(weeks).map(([wk, days]) => {
+      {Object.entries(weeks).map(([wk, days], wIdx) => {
         const relevant = days.filter(d => d.posts.some(p => p.channel === channel));
         const isOpen = Number(wk) === openWeek;
         return (
-          <Card key={wk} className="!p-0 overflow-hidden">
-            <button onClick={() => setOpenWeek(isOpen ? 0 : Number(wk))} className="w-full flex items-center justify-between px-5 py-3.5">
+          <Card key={wk} className="!p-0 overflow-hidden" delay={wIdx * 40}>
+            <button onClick={() => setOpenWeek(isOpen ? 0 : Number(wk))} className="w-full flex items-center justify-between px-5 py-3.5 hover:bg-slate-800/30 transition-colors">
               <span className="font-semibold text-slate-100 text-sm">Week {wk}</span>
               <div className="flex items-center gap-2">
                 <span className="text-xs text-slate-500" style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{relevant.reduce((n, d) => n + d.posts.filter(p => p.channel === channel).length, 0)} posts</span>
-                {isOpen ? <ChevronDown size={16} className="text-slate-400" /> : <ChevronRight size={16} className="text-slate-400" />}
+                <ChevronDown size={16} className="text-slate-400 chevron-rotate" style={{ transform: isOpen ? 'rotate(0deg)' : 'rotate(-90deg)' }} />
               </div>
             </button>
-            {isOpen && (
-              <div className="px-5 pb-4 space-y-2 border-t border-slate-800">
-                {days.map(d => {
-                  const post = d.posts.find(p => p.channel === channel);
-                  if (!post) return (
-                    <div key={d.dayNumber} className="flex items-center gap-3 py-1.5 opacity-40 text-xs">
-                      <span className="w-20 shrink-0" style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{formatDate(d.date)}</span>
-                      <span>— no post</span>
-                    </div>
-                  );
-                  const meta = channel === 'longform' ? GENRE_META[post.genre] : null;
-                  return (
-                    <div key={d.dayNumber} className="flex flex-col gap-1 py-2 border-b border-slate-800/50 last:border-0">
-                      <div className="flex items-center gap-2 text-xs text-slate-500">
-                        <span style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{formatDate(d.date)}</span>
-                        <span className="text-slate-700">·</span>
-                        <span className="capitalize" style={{ color: channel === 'longform' ? meta.color : (post.type === 'romantic' ? '#f472b6' : '#f59e0b') }}>{channel === 'longform' ? post.genre : post.type}</span>
+            <div className="accordion-body" style={{ gridTemplateRows: isOpen ? '1fr' : '0fr' }}>
+              <div>
+                <div className="px-5 pb-4 space-y-2 border-t border-slate-800">
+                  {days.map((d, dIdx) => {
+                    const post = d.posts.find(p => p.channel === channel);
+                    if (!post) return (
+                      <div key={d.dayNumber} className="flex items-center gap-3 py-1.5 opacity-40 text-xs">
+                        <span className="w-20 shrink-0" style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{formatDate(d.date)}</span>
+                        <span>— no post</span>
                       </div>
-                      <p className="text-sm text-slate-100 font-medium">{post.movie.title}</p>
-                      <p className="text-xs text-slate-500">{post.movie.hook || post.movie.note}</p>
-                      <p className="text-xs text-teal-400/80">Reference search: "{post.searchQuery}"</p>
-                    </div>
-                  );
-                })}
+                    );
+                    const meta = channel === 'longform' ? GENRE_META[post.genre] : null;
+                    return (
+                      <div key={d.dayNumber} className="flex flex-col gap-1 py-2 border-b border-slate-800/50 last:border-0 animate-cardin" style={{ animationDelay: isOpen ? `${dIdx * 35}ms` : '0ms' }}>
+                        <div className="flex items-center gap-2 text-xs text-slate-500">
+                          <span style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{formatDate(d.date)}</span>
+                          <span className="text-slate-700">·</span>
+                          <span className="capitalize" style={{ color: channel === 'longform' ? meta.color : (post.type === 'romantic' ? '#f472b6' : '#f59e0b') }}>{channel === 'longform' ? post.genre : post.type}</span>
+                        </div>
+                        <p className="text-sm text-slate-100 font-medium">{post.movie.title}</p>
+                        <p className="text-xs text-slate-500">{post.movie.hook || post.movie.note}</p>
+                        <p className="text-xs text-teal-400/80">Reference search: "{post.searchQuery}"</p>
+                      </div>
+                    );
+                  })}
+                </div>
               </div>
-            )}
+            </div>
           </Card>
         );
       })}
@@ -546,17 +642,17 @@ function ScheduleView({ schedule, channel }) {
 function LibraryView({ channel }) {
   const [genreFilter, setGenreFilter] = useState('all');
   return (
-    <div className="space-y-4 animate-fadein">
-      <Card className="!py-3">
+    <div className="space-y-4">
+      <Card className="!py-3" delay={0}>
         <p className="text-xs text-slate-400 flex items-start gap-1.5"><Info size={13} className="mt-0.5 shrink-0" /> Keep every recap and cutout transformative — your own commentary/narration, short clip lengths relative to runtime, and original editing. That is also what YouTube’s 2026 "inauthentic content" policy expects from reused footage.</p>
       </Card>
 
       {channel === 'longform' ? (
         <>
-          <div className="flex gap-2 flex-wrap">
+          <div className="flex gap-2 flex-wrap animate-cardin" style={{ animationDelay: '60ms' }}>
             {['all', 'thriller', 'horror', 'romance', 'mystery'].map(g => (
               <button key={g} onClick={() => setGenreFilter(g)}
-                className={`px-3 py-1 rounded-full text-xs capitalize border transition-colors ${genreFilter === g ? 'bg-teal-500 border-teal-500 text-slate-950 font-semibold' : 'border-slate-700 text-slate-400 hover:text-slate-200'}`}>
+                className={`px-3 py-1 rounded-full text-xs capitalize border active:scale-90 ${genreFilter === g ? 'bg-teal-500 border-teal-500 text-slate-950 font-semibold scale-105 shadow-lg shadow-teal-500/20' : 'border-slate-700 text-slate-400 hover:text-slate-200 hover:border-slate-600 hover:scale-105'}`}>
                 {g}
               </button>
             ))}
@@ -567,9 +663,9 @@ function LibraryView({ channel }) {
                 const meta = GENRE_META[genre];
                 const Icon = meta.icon;
                 return (
-                  <Card key={genre + i} className="!p-4">
+                  <Card key={genre + i} className="!p-4 group" delay={Math.min(i, 12) * 45}>
                     <div className="flex items-center gap-1.5 mb-1.5">
-                      <Icon size={13} style={{ color: meta.color }} />
+                      <Icon size={13} style={{ color: meta.color }} className="transition-transform duration-300 group-hover:scale-125 group-hover:rotate-6" />
                       <span className="text-[11px] uppercase tracking-wide" style={{ color: meta.color }}>{meta.label} · {m.window}</span>
                     </div>
                     <h4 className="font-semibold text-slate-100 mb-1">{m.title}</h4>
@@ -584,9 +680,11 @@ function LibraryView({ channel }) {
       ) : (
         <div className="grid sm:grid-cols-2 gap-4">
           {SHORTS_LIBRARY.map((m, i) => (
-            <Card key={i} className="!p-4">
+            <Card key={i} className="!p-4 group" delay={Math.min(i, 12) * 45}>
               <div className="flex items-center gap-1.5 mb-1.5">
-                {m.type === 'romantic' ? <Heart size={13} className="text-pink-400" /> : <Laugh size={13} className="text-amber-400" />}
+                {m.type === 'romantic'
+                  ? <Heart size={13} className="text-pink-400 transition-transform duration-300 group-hover:scale-125" />
+                  : <Laugh size={13} className="text-amber-400 transition-transform duration-300 group-hover:scale-125 group-hover:rotate-6" />}
                 <span className={`text-[11px] uppercase tracking-wide ${m.type === 'romantic' ? 'text-pink-400' : 'text-amber-400'}`}>{m.type}</span>
               </div>
               <h4 className="font-semibold text-slate-100 mb-1">{m.title}</h4>
@@ -596,7 +694,7 @@ function LibraryView({ channel }) {
         </div>
       )}
 
-      <Card>
+      <Card delay={100}>
         <h4 className="font-semibold text-slate-100 text-sm mb-2 flex items-center gap-1.5"><Search size={14} /> Reference & inspiration</h4>
         <div className="space-y-1.5">
           {REFERENCE_NOTES.map((r, i) => (
@@ -616,18 +714,24 @@ function EditingView({ channel }) {
       {sections.map((s, i) => {
         const isOpen = openIdx === i;
         return (
-          <Card key={i} className="!p-0 overflow-hidden">
-            <button onClick={() => setOpenIdx(isOpen ? -1 : i)} className="w-full flex items-center justify-between px-5 py-3.5">
-              <span className="flex items-center gap-2 font-semibold text-slate-100 text-sm"><Wand2 size={15} className="text-amber-400" /> {s.title}</span>
-              {isOpen ? <ChevronDown size={16} className="text-slate-400" /> : <ChevronRight size={16} className="text-slate-400" />}
+          <Card key={i} className="!p-0 overflow-hidden" delay={i * 45}>
+            <button onClick={() => setOpenIdx(isOpen ? -1 : i)} className="w-full flex items-center justify-between px-5 py-3.5 hover:bg-slate-800/30 transition-colors group">
+              <span className="flex items-center gap-2 font-semibold text-slate-100 text-sm">
+                <Wand2 size={15} className={`text-amber-400 transition-transform duration-300 ${isOpen ? '-rotate-12 scale-110' : 'group-hover:rotate-6'}`} /> {s.title}
+              </span>
+              <ChevronDown size={16} className="text-slate-400 chevron-rotate" style={{ transform: isOpen ? 'rotate(0deg)' : 'rotate(-90deg)' }} />
             </button>
-            {isOpen && (
-              <ul className="px-5 pb-4 space-y-2 border-t border-slate-800 pt-3">
-                {s.tips.map((t, j) => (
-                  <li key={j} className="text-sm text-slate-300 flex gap-2"><span className="text-teal-400 shrink-0">•</span>{t}</li>
-                ))}
-              </ul>
-            )}
+            <div className="accordion-body" style={{ gridTemplateRows: isOpen ? '1fr' : '0fr' }}>
+              <div>
+                <ul className="px-5 pb-4 space-y-2 border-t border-slate-800 pt-3">
+                  {s.tips.map((t, j) => (
+                    <li key={j} className="text-sm text-slate-300 flex gap-2 animate-cardin" style={{ animationDelay: isOpen ? `${j * 60}ms` : '0ms' }}>
+                      <span className="text-teal-400 shrink-0">•</span>{t}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            </div>
           </Card>
         );
       })}
@@ -648,19 +752,19 @@ function MonetizationView({ stats, updateStats }) {
   );
 
   return (
-    <div className="space-y-5 animate-fadein">
-      <Card>
-        <h4 className="font-semibold text-slate-100 mb-3 flex items-center gap-2"><DollarSign size={16} className="text-amber-400" /> Your current numbers</h4>
+    <div className="space-y-5">
+      <Card delay={0}>
+        <h4 className="font-semibold text-slate-100 mb-3 flex items-center gap-2"><DollarSign size={16} className="text-amber-400 animate-float" /> Your current numbers</h4>
         <div className="grid sm:grid-cols-2 gap-4">
           <div className="space-y-2">
             <p className="text-xs uppercase tracking-widest text-teal-400">Long-form</p>
-            <Row label="Subscribers" value={stats.lfSubs} onChange={v => updateStats({ ...stats, lfSubs: v })} suffix="" />
-            <Row label="Watch hours (12mo)" value={stats.lfHours} onChange={v => updateStats({ ...stats, lfHours: v })} suffix="hrs" />
+            <Row label="Subscribers" value={stats.lfSubs} onChange={v => updateStats({ lfSubs: v })} suffix="" />
+            <Row label="Watch hours (12mo)" value={stats.lfHours} onChange={v => updateStats({ lfHours: v })} suffix="hrs" />
           </div>
           <div className="space-y-2">
             <p className="text-xs uppercase tracking-widest text-amber-400">Shorts</p>
-            <Row label="Subscribers" value={stats.shSubs} onChange={v => updateStats({ ...stats, shSubs: v })} suffix="" />
-            <Row label="Views (90-day)" value={stats.shViews} onChange={v => updateStats({ ...stats, shViews: v })} suffix="views" />
+            <Row label="Subscribers" value={stats.shSubs} onChange={v => updateStats({ shSubs: v })} suffix="" />
+            <Row label="Views (90-day)" value={stats.shViews} onChange={v => updateStats({ shViews: v })} suffix="views" />
           </div>
         </div>
       </Card>
@@ -675,11 +779,16 @@ function MonetizationView({ stats, updateStats }) {
         const shViewsPct = Math.min(100, (stats.shViews / tier.views) * 100);
         const lfEligible = lfSubsPct >= 100 && lfHoursPct >= 100;
         const shEligible = shSubsPct >= 100 && shViewsPct >= 100;
+        const eligible = lfEligible || shEligible;
         return (
-          <Card key={i}>
+          <Card key={i} delay={120 + i * 90} className={eligible ? 'ring-1 ring-teal-500/40' : ''}>
             <div className="flex items-center justify-between mb-3">
               <h4 className="font-semibold text-slate-100 text-sm">{tier.title}</h4>
-              {(lfEligible || shEligible) && <span className="text-xs bg-teal-500/20 text-teal-300 px-2 py-0.5 rounded-full flex items-center gap-1"><Award size={12} /> Eligible</span>}
+              {eligible && (
+                <span key="eligible-badge" className="text-xs bg-teal-500/20 text-teal-300 px-2 py-0.5 rounded-full flex items-center gap-1 animate-pop">
+                  <Award size={12} className="animate-float" /> Eligible
+                </span>
+              )}
             </div>
             {tier.uploads && <p className="text-xs text-slate-500 mb-3">Also requires: {tier.uploads}.</p>}
             <div className="grid sm:grid-cols-2 gap-4">
@@ -699,7 +808,7 @@ function MonetizationView({ stats, updateStats }) {
           </Card>
         );
       })}
-      <Card className="!py-3">
+      <Card className="!py-3" delay={320}>
         <p className="text-xs text-slate-500">Either path (watch hours OR Shorts views) qualifies a channel independently — you don’t need both. Numbers reflect YPP requirements as of 2026; always confirm current thresholds in YouTube Studio before applying.</p>
       </Card>
     </div>
@@ -718,18 +827,30 @@ const TABS = [
 ];
 
 export default function App() {
-  const [state, setState, ready] = usePersistentState();
+  const [state, setState, ready, saveStatus] = usePersistentState();
   const [tab, setTab] = useState('dashboard');
   const [channel, setChannel] = useState('longform');
+  const tabRefs = useRef({});
+  const [indicator, setIndicator] = useState({ left: 0, width: 0, opacity: 0 });
 
   const schedule = useMemo(() => generateSchedule(state.startDateISO || isoDate(new Date())), [state.startDateISO]);
   const currentPhase = schedule[0] ? schedule[0].phase : PHASES[0];
 
-  const updateStats = (stats) => setState({ ...state, stats });
-  const updateStart = (val) => setState({ ...state, startDateISO: val });
+  const updateStats = (partial) => setState(prev => ({ ...prev, stats: { ...prev.stats, ...partial } }));
+  const updateStart = (val) => setState(prev => ({ ...prev, startDateISO: val }));
+
+  useEffect(() => {
+    const el = tabRefs.current[tab];
+    if (el) setIndicator({ left: el.offsetLeft, width: el.offsetWidth, opacity: 1 });
+  }, [tab, ready]);
 
   if (!ready) {
-    return <div className="min-h-screen bg-slate-950 flex items-center justify-center text-slate-500 text-sm">Loading roadmap…</div>;
+    return (
+      <div className="min-h-screen bg-slate-950 flex items-center justify-center text-slate-500 text-sm">
+        <span className="inline-block w-4 h-4 mr-2 rounded-full border-2 border-slate-700 border-t-teal-400 animate-spin-slow" style={{ animationDuration: '.8s' }} />
+        Loading roadmap…
+      </div>
+    );
   }
 
   const activeTabMeta = TABS.find(t => t.id === tab);
@@ -738,48 +859,85 @@ export default function App() {
     <div className="min-h-screen bg-slate-950 text-slate-100" style={{ fontFamily: "'Manrope', sans-serif" }}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Manrope:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500&display=swap');
+
         @keyframes flicker { 0%{opacity:0;} 8%{opacity:1;} 14%{opacity:.25;} 20%{opacity:1;} 100%{opacity:1;} }
-        @keyframes fadeInUp { from{opacity:0; transform:translateY(8px);} to{opacity:1; transform:translateY(0);} }
-        .animate-fadein { animation: fadeInUp .4s ease-out; }
+        @keyframes fadeInUp { from{opacity:0; transform:translateY(10px) scale(.98);} to{opacity:1; transform:translateY(0) scale(1);} }
+        @keyframes cardIn { from{opacity:0; transform:translateY(14px);} to{opacity:1; transform:translateY(0);} }
+        @keyframes popCheck { 0%{transform:scale(.4) rotate(-15deg); opacity:0;} 60%{transform:scale(1.25) rotate(4deg); opacity:1;} 100%{transform:scale(1) rotate(0);} }
+        @keyframes glowPulse { 0%,100%{ filter: drop-shadow(0 0 2px rgba(45,212,191,.35)); } 50%{ filter: drop-shadow(0 0 9px rgba(245,158,11,.55)); } }
+        @keyframes shimmerSweep { 0%{ transform: translateX(-120%) skewX(-15deg); } 100%{ transform: translateX(220%) skewX(-15deg); } }
+        @keyframes barShimmer { 0%{ background-position: 0% 0; } 100%{ background-position: 200% 0; } }
+        @keyframes floatSlow { 0%,100%{ transform: translateY(0); } 50%{ transform: translateY(-4px); } }
+        @keyframes spinSlow { from{ transform: rotate(0deg);} to{ transform: rotate(360deg);} }
+        @keyframes ambientPulse { 0%,100%{ opacity:.35; transform: scale(1);} 50%{ opacity:.6; transform: scale(1.08);} }
+
+        .animate-fadein { animation: fadeInUp .45s cubic-bezier(.16,1,.3,1) both; }
+        .animate-cardin { animation: cardIn .5s cubic-bezier(.16,1,.3,1) both; }
+        .animate-pop { animation: popCheck .38s cubic-bezier(.34,1.56,.64,1) both; }
+        .animate-glow { animation: glowPulse 3.2s ease-in-out infinite; }
+        .animate-float { animation: floatSlow 4s ease-in-out infinite; }
+        .animate-spin-slow { animation: spinSlow 12s linear infinite; }
+
+        .hover-lift { transition: transform .28s cubic-bezier(.16,1,.3,1), box-shadow .28s ease, border-color .28s ease; }
+        .hover-lift:hover { transform: translateY(-3px); box-shadow: 0 10px 30px -12px rgba(45,212,191,.25); }
+
+        .accordion-body { display: grid; overflow: hidden; transition: grid-template-rows .38s cubic-bezier(.16,1,.3,1); }
+        .accordion-body > div { min-height: 0; overflow: hidden; }
+        .chevron-rotate { transition: transform .3s cubic-bezier(.16,1,.3,1); }
+
+        .progress-shimmer { background-image: linear-gradient(110deg, transparent 30%, rgba(255,255,255,.35) 50%, transparent 70%); background-size: 200% 100%; animation: barShimmer 1.8s linear infinite; }
+
         input[type=number]::-webkit-inner-spin-button { opacity: 0.4; }
+        input, button { transition: border-color .2s ease, background-color .2s ease, transform .15s ease; }
       `}</style>
 
-      <div className="max-w-5xl mx-auto px-4 sm:px-6 py-8">
-        <header className="mb-6">
+      <div className="fixed inset-0 overflow-hidden pointer-events-none">
+        <div className="absolute -top-24 -left-24 w-96 h-96 rounded-full bg-teal-500/[0.06] blur-3xl" style={{ animation: 'ambientPulse 8s ease-in-out infinite' }} />
+        <div className="absolute -bottom-24 -right-24 w-96 h-96 rounded-full bg-amber-500/[0.06] blur-3xl" style={{ animation: 'ambientPulse 9s ease-in-out infinite 1.5s' }} />
+      </div>
+
+      <div className="relative z-10 max-w-5xl mx-auto px-4 sm:px-6 py-8">
+        <header className="mb-6 animate-cardin">
           <div className="flex items-center gap-2 mb-1">
-            <Sparkles size={16} className="text-amber-400" />
+            <Sparkles size={16} className="text-amber-400 animate-float" />
             <span className="text-xs uppercase tracking-[0.2em] text-slate-500" style={{ fontFamily: "'IBM Plex Mono', monospace" }}>90-day launch tracker</span>
           </div>
           <MarqueeTitle text="THE 90-DAY CUT" />
           <p className="text-slate-400 text-sm mt-1">Two faceless channels, one shared runway to monetization.</p>
-          <div className="mt-3 flex items-center gap-2 text-xs text-slate-500">
+          <div className="mt-3 flex items-center gap-2 text-xs text-slate-500 flex-wrap">
             <Clock size={13} />
             <span>Launch date:</span>
             <input type="date" value={state.startDateISO} onChange={e => updateStart(e.target.value)}
-              className="bg-slate-900 border border-slate-800 rounded-lg px-2 py-1 text-slate-300 focus:outline-none focus:border-teal-400" />
+              className="bg-slate-900 border border-slate-800 rounded-lg px-2 py-1 text-slate-300 focus:outline-none focus:border-teal-400 focus:scale-105" />
+            <span className="text-slate-700 mx-1">·</span>
+            <SaveIndicator status={saveStatus} />
           </div>
         </header>
 
-        <nav className="flex gap-1 overflow-x-auto pb-2 mb-5 -mx-1 px-1">
+        <nav className="relative flex gap-1 overflow-x-auto pb-2 mb-5 -mx-1 px-1">
+          <div
+            className="absolute top-0 bottom-2 rounded-xl bg-gradient-to-br from-slate-800 to-slate-800/60 shadow-inner pointer-events-none"
+            style={{ left: indicator.left, width: indicator.width, opacity: indicator.opacity, transition: 'left .4s cubic-bezier(.16,1,.3,1), width .4s cubic-bezier(.16,1,.3,1), opacity .25s ease' }}
+          />
           {TABS.map(t => {
             const Icon = t.icon;
             const isActive = tab === t.id;
             return (
-              <button key={t.id} onClick={() => setTab(t.id)}
-                className={`flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm whitespace-nowrap transition-all duration-200 shrink-0 ${isActive ? 'bg-slate-800 text-slate-50 shadow-inner' : 'text-slate-500 hover:text-slate-300'}`}>
-                <Icon size={15} /> {t.label}
+              <button key={t.id} ref={el => { tabRefs.current[t.id] = el; }} onClick={() => setTab(t.id)}
+                className={`relative z-10 flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm whitespace-nowrap transition-colors duration-200 shrink-0 active:scale-95 ${isActive ? 'text-slate-50' : 'text-slate-500 hover:text-slate-300'}`}>
+                <Icon size={15} className={`transition-all duration-300 ${isActive ? 'text-teal-400 scale-110' : ''}`} /> {t.label}
               </button>
             );
           })}
         </nav>
 
         {activeTabMeta.channelAware && (
-          <div className="mb-5">
+          <div className="mb-5 animate-cardin" key={`toggle-${tab}`}>
             <ChannelToggle channel={channel} setChannel={setChannel} />
           </div>
         )}
 
-        <main key={tab + channel}>
+        <main key={tab + channel} className="animate-fadein">
           {tab === 'dashboard' && <DashboardView schedule={schedule} phase={currentPhase} stats={state.stats} />}
           {tab === 'roadmap' && <RoadmapView channel={channel} state={state} setState={setState} />}
           {tab === 'schedule' && <ScheduleView schedule={schedule} channel={channel} />}
@@ -788,8 +946,12 @@ export default function App() {
           {tab === 'monetize' && <MonetizationView stats={state.stats} updateStats={updateStats} />}
         </main>
 
-        <footer className="mt-10 pt-5 border-t border-slate-800 text-center">
-          <p className="text-xs text-slate-600">Progress and checklists save automatically on this device.</p>
+        <footer className="mt-10 pt-5 border-t border-slate-800 text-center animate-cardin">
+          <p className="text-xs text-slate-600">
+            {saveStatus === 'error'
+              ? 'Having trouble saving right now — your changes are kept while this tab stays open, and will keep retrying in the background.'
+              : 'Progress and checklists save automatically on this device.'}
+          </p>
         </footer>
       </div>
     </div>
